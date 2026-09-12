@@ -1,10 +1,25 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { LISTING_STATUSES, type FacetsResponse, type Listing, type ListingStatus } from '@billio/shared';
+import { findUpwards } from '../paths.js';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_DATA_PATH = path.resolve(here, '../../../data/sample_listings.json');
+const DATA_FILE = 'data/sample_listings.json';
+
+/**
+ * Resolved lazily so an unusual deployment layout surfaces as a clear startup
+ * error naming the override, rather than as a crash at import time.
+ */
+function defaultDataPath(): string {
+  const fromEnv = process.env.LISTINGS_DATA_PATH;
+  if (fromEnv) return path.resolve(fromEnv);
+
+  const found = findUpwards(DATA_FILE);
+  if (found) return found;
+
+  throw new Error(
+    `Could not locate ${DATA_FILE} near the server bundle. Set LISTINGS_DATA_PATH to its absolute path.`,
+  );
+}
 
 /**
  * Feeds are external systems, so the file is validated rather than cast. A single
@@ -77,7 +92,7 @@ export class ListingsRepository {
     return new ListingsRepository(listings, skipped);
   }
 
-  static async load(dataPath: string = DEFAULT_DATA_PATH): Promise<ListingsRepository> {
+  static async load(dataPath: string = defaultDataPath()): Promise<ListingsRepository> {
     const contents = await readFile(dataPath, 'utf8');
     const { listings, skipped } = parseListings(JSON.parse(contents));
     return new ListingsRepository(listings, skipped);

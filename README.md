@@ -18,18 +18,101 @@ npm install
 npm run dev
 #   → open http://localhost:5173
 
-# Production-ish: build the client, serve everything from the API on one port
-npm run build
-npm start
-#   → open http://localhost:4000
-
-npm test          # 195 tests across shared / server / client
+npm test          # 207 tests across shared / server / client
 npm run typecheck # strict tsc over all three workspaces
 ```
+
+For the production build, see [Shipping to production](#shipping-to-production).
 
 The dataset (`data/sample_listings.json`, 12 listings) is loaded into memory at
 startup. `ListingsRepository` is the only thing that knows that — swapping in a
 database means replacing that one class.
+
+---
+
+## Shipping to production
+
+```bash
+npm ci
+npm run build     # typecheck → client bundle → server bundle
+npm start         # node server/dist/index.js
+#   → open http://localhost:4000
+```
+
+`npm run build` produces two artifacts and nothing else is needed to run:
+
+| Artifact | Built by | What it is |
+|---|---|---|
+| `client/dist/` | Vite | Hashed, minified static assets |
+| `server/dist/index.js` | esbuild | The whole API as one ESM file (~22 kB) |
+
+**The server bundle contains no TypeScript and needs no build toolchain to run.**
+`@billio/shared` is a source-only workspace package that is never published, so it
+is bundled *in*; `express` and `cors` stay external and are installed from the
+lockfile, which keeps CJS-heavy dependencies loading exactly as they normally do.
+[`server/build.mjs`](server/build.mjs) reads the externals straight from
+`server/package.json`, so a new dependency cannot fall out of sync with it.
+
+In production the API serves the built client from the same origin, so the whole
+thing is one process on one port.
+
+### To ship it, you need exactly
+
+```
+package.json  package-lock.json     # + each workspace's package.json
+node_modules/                       # npm ci --omit=dev  (~6 MB: express, cors)
+server/dist/                        # the API bundle
+client/dist/                        # the static client
+data/sample_listings.json           # the dataset
+```
+
+Then `node server/dist/index.js`.
+
+### Container
+
+```bash
+docker build -t listing-search .
+docker run --rm -p 4000:4000 listing-search
+```
+
+The [`Dockerfile`](Dockerfile) is a two-stage build: the first stage runs the full
+typecheck and both bundles, the second copies only the two build outputs, the
+dataset, and production-only dependencies into a clean `node:22-alpine` image. It
+runs as the non-root `node` user, declares a `HEALTHCHECK` against `/api/health`,
+and uses an exec-form `CMD` (no npm wrapper) so the process receives `SIGTERM`
+directly and can drain in-flight requests.
+
+### Configuration
+
+All optional — the defaults are what you want for a single-process deployment.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `4000` | Listen port |
+| `HOST` | `0.0.0.0` | Listen address (`0.0.0.0` so containers are reachable) |
+| `CORS_ORIGIN` | *unset* | Comma-separated allowed origins, or `*`. See below |
+| `CLIENT_DIST_PATH` | auto-detected | Override the built client's location |
+| `LISTINGS_DATA_PATH` | auto-detected | Override the dataset's location |
+
+**CORS is off by default and that is deliberate.** The client is served from the
+same origin in production, and the Vite dev server proxies `/api` in development,
+so neither case needs it. Set `CORS_ORIGIN` only when hosting the client
+separately — shipping a wide-open `Access-Control-Allow-Origin: *` because it was
+convenient in development is how APIs end up publicly readable by any page.
+
+Path auto-detection walks up from the running module rather than assuming a fixed
+depth, because the server runs from `server/src/**` under tsx in development and
+from a single `server/dist/index.js` in production. A hard-coded `../../..` works
+in one layout and silently breaks in the other.
+
+### What production mode does that dev mode doesn't
+
+- Serves `/assets` (Vite fingerprints those filenames) with `immutable, max-age=1y`,
+  while `index.html` is `max-age=0` — otherwise browsers keep requesting the
+  previous deploy's asset URLs.
+- Handles `SIGTERM`/`SIGINT` by closing the listener so in-flight requests finish,
+  with a 10s hard-exit backstop.
+- Drops the `X-Powered-By` header.
 
 ---
 
@@ -174,9 +257,12 @@ for 12 listings, fine for a few thousand. Beyond that, filtering and ranking
 belong in the database (or a search index), with the scoring formula pushed down
 as a computed column.
 
-**`npm start` runs TypeScript directly via `tsx`** rather than emitting JS. It
-keeps the toolchain to one step for an exercise of this size; a real deployment
-would compile ahead of time.
+**The production bundle is built with esbuild rather than `tsc` emit.** A
+monorepo with a source-only shared package makes `tsc` emit awkward — it needs
+project references, a dual `exports` map pointing at `src` in development and
+`dist` in production, and it leaves the workspace symlink to resolve at runtime.
+Bundling sidesteps all of that and yields one self-contained file. The cost is
+that stack traces go through a source map, which is why the build emits one.
 
 ---
 
@@ -209,7 +295,7 @@ used to build the city select and the price hints from real data.
 
 ## Tests
 
-195 tests. `npm test` runs all three projects.
+207 tests. `npm test` runs all three projects.
 
 **Core logic** (`server/tests`, `shared/tests`) — every scoring component at its
 boundaries (at budget, at the over-budget cliff, far under, future dates,
@@ -224,6 +310,10 @@ unparseable dates); filter inclusivity; the full pipeline.
 - *Pagination boundaries* — first/middle/last page, exact multiples of `pageSize`,
   partial final page, `pageSize` > total, page past the end, and defensive
   handling of a non-positive `pageSize` or `page` reaching the paginator.
+
+**Production surface** (`server/tests/config.test.ts`) — path auto-detection in
+both layouts, the `LISTINGS_DATA_PATH` override, and CORS staying closed unless
+`CORS_ORIGIN` is set (including that a non-listed origin is refused).
 
 **Client** (`client/tests`) — loading, results, no-results and error states;
 invalid input proven to never reach the network; pagination; the out-of-range
@@ -241,6 +331,7 @@ shared/src/
   types.ts              Listing, RankedListing, SearchParams, SearchResponse, ApiErrorBody
   search-params.ts      One validator, used by both tiers
 server/src/
+  paths.ts              Layout-independent path resolution (dev vs bundle)
   domain/score.ts       Scoring — pure functions, injected clock
   domain/filter.ts      Hard filtering gate, separate from ranking
   domain/dedupe.ts      Cross-feed near-duplicate collapsing
